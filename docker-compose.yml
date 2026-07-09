@@ -1,0 +1,91 @@
+services:
+  # --- MLflow tracking + registry (sqlite backend, proxied artifact store) ---------
+  mlflow:
+    build:
+      context: ./docker/mlflow
+    image: sl-predictor-mlflow:2.22.0
+    container_name: sl-predictor-mlflow
+    restart: unless-stopped
+    # Published on loopback only — the tracking server is not exposed off-host.
+    ports:
+      - "127.0.0.1:5000:5000"
+    volumes:
+      # sqlite backend store + artifact files persist on the host.
+      - ./mlflow-data:/mlflow
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:5000/health').status==200 else sys.exit(1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # --- Prediction service (FastAPI) ------------------------------------------------
+  # Requires a promoted model: run `docker compose run --rm retrain` (or train.py) once
+  # so `sl_classifier@production` exists before this starts.
+  predictor:
+    build:
+      context: .
+      dockerfile: docker/service/Dockerfile
+    image: sl-predictor-service:latest
+    container_name: sl-predictor-service
+    restart: unless-stopped
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    environment:
+      SLP_MLFLOW_URI: http://mlflow:5000        # compose-network DNS, not 127.0.0.1
+      SLP_FEATURE_STORE_DB: /data/feature_store.db
+      SLP_LOG_DIR: /logs                        # one JSON line per /predict call
+      GIT_PYTHON_REFRESH: quiet                 # no git binary in the slim image
+    ports:
+      - "127.0.0.1:8100:8100"
+    volumes:
+      - feature-store:/data                     # prediction log (shared with retrain)
+      - ./logs:/logs                            # predictions.log, readable on the host
+    # uvicorn stdout (incl. the 15s healthcheck line) is capped; predictions.log has its
+    # own rotation and is the durable record.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    command: ["uvicorn", "serving.app:app", "--host", "0.0.0.0", "--port", "8100"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8100/health').status==200 else sys.exit(1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # --- Retrain job (one-shot; started only via `docker compose run --rm retrain`) --
+  # `profiles` keeps it out of `docker compose up`. Cron invokes it (see retrain_cron.sh).
+  retrain:
+    image: sl-predictor-service:latest          # same image as predictor
+    build:
+      context: .
+      dockerfile: docker/service/Dockerfile
+    profiles: ["tools"]
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    environment:
+      SLP_MLFLOW_URI: http://mlflow:5000
+      SLP_SERVICE_URI: http://predictor:8100    # for the post-retrain /reload
+      SLP_FEATURE_STORE_DB: /data/feature_store.db
+      SLP_DATASET_DIR: /dataset                 # dataset.csv lives here
+      SLP_KLINE_CACHE: /kline-cache
+      SLP_FUNDING_DB: /funding/funding_bot.db
+      GIT_PYTHON_REFRESH: quiet
+    volumes:
+      - feature-store:/data
+      # the incremental training set (rw). Must be a DIRECTORY mount, not a file mount:
+      # dataset_csv.save_atomic uses os.replace, which swaps the inode — a single-file
+      # bind mount would pin the stale inode and the host would never see the update.
+      - ./data:/dataset
+      # training inputs (read-only) — the kline cache + the funding bot's label db
+      - /root/funding-trader-bot/feature_mining/data:/kline-cache:ro
+      - /root/funding-trader-bot/db:/funding:ro
+    command: ["python", "retrain_monthly.py"]
+
+volumes:
+  feature-store:

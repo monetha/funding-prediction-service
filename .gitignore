@@ -1,0 +1,25 @@
+# MLflow persisted state (sqlite backend store + artifact files)
+mlflow-data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local sqlite feature store
+serving/feature_store.db
+*.db
+
+# Data
+*.parquet
+mlartifacts/
+
+# The incremental training set (irreplaceable — back this up, don't commit it)
+data/
+
+# retrain cron logs + the per-request prediction log
+logs/
+
+# local Claude Code permissions (machine-specific)
+.claude/settings.local.json

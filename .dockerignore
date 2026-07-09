@@ -1,0 +1,15 @@
+.venv/
+venv/
+mlflow-data/
+mlartifacts/
+logs/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.db
+*.parquet
+.git/
+.gitignore
+.pytest_cache/
+tests/.pytest_cache/
+docker/

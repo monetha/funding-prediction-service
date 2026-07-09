@@ -1,0 +1,31 @@
+# SL-Probability Prediction Service — train + serve share ONE environment so the
+# mlflow-logged model round-trips byte-for-byte and featuregen produces identical
+# features on both sides (train/serve parity is the plan's #1 risk).
+#
+# Pin rationale:
+#   scikit-learn==1.8.0 — the env that validated walk-forward AUC 0.654; the vendored
+#     model.py is written against 1.8.0's `penalty=` behavior. (mlflow needs <2.)
+#   pandas<3           — mlflow 2.22.0 caps pandas<3, and serving imports mlflow +
+#     computes features in the same process, so featuregen runs under pandas 2 in prod.
+#   mlflow==2.22.0     — matches the tracking/registry server image exactly.
+#   numpy 2.2.6        — the reproduced-0.654 host version; compatible with all of the above.
+
+# --- core ML / data ---
+numpy==2.2.6
+pandas==2.3.3
+scipy==1.16.1
+scikit-learn==1.8.0
+xgboost==3.2.0
+pyarrow==19.0.1        # mlflow 2.22.0 caps pyarrow<20
+
+# --- experiment tracking + model registry (client; server runs in Docker) ---
+mlflow==2.22.0
+
+# --- serving ---
+fastapi==0.135.1
+uvicorn==0.41.0
+aiohttp==3.13.3
+requests==2.32.5
+
+# --- test/parity ---
+pytest==8.4.1
