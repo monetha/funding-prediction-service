@@ -29,6 +29,7 @@ from mlflow.tracking import MlflowClient
 
 import dataset as dataset_mod
 import model as M
+from data_sources import DEFAULT_FUNDING_DB
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -66,8 +67,12 @@ def _gate(new_auc: float, prod_auc: float | None) -> tuple[bool, str]:
                    f"(max({ABS_FLOOR}, prod {prod_auc:.4f} - {SLACK})) — keeping prod")
 
 
-def train(ds: pd.DataFrame) -> dict:
-    """Fit + evaluate + log + register + gate. Returns a summary dict."""
+def train(ds: pd.DataFrame, source: str | None = None) -> dict:
+    """Fit + evaluate + log + register + gate. Returns a summary dict.
+
+    `source` is the provenance URI of `ds` (parquet path, dataset.csv, funding db);
+    it only labels the logged dataset — the digest is hashed from `ds` itself.
+    """
     mlflow.set_tracking_uri(TRACKING_URI)
     mlflow.set_experiment(EXPERIMENT)
     client = MlflowClient()
@@ -88,6 +93,13 @@ def train(ds: pd.DataFrame) -> dict:
     Xf = ds.sort_values("opened_at").reset_index(drop=True)[feats].astype("float32")
 
     with mlflow.start_run() as run:
+        # the labeled frame the production model is fit on — digest changes whenever
+        # positions are added/relabeled, even if `source` is a stable path
+        mlflow.log_input(
+            mlflow.data.from_pandas(ds, source=source, targets=M.TARGET,
+                                    name="sl_positions"),
+            context="train",
+        )
         mlflow.log_params({
             "penalty": M.PENALTY, "C": M.C,
             "feature_lag_min": dataset_mod.FEATURE_LAG_MIN,
@@ -148,11 +160,14 @@ def main() -> None:
     ap.add_argument("--dataset", help="prebuilt parquet; if omitted, build from source")
     args = ap.parse_args()
 
-    ds = pd.read_parquet(args.dataset) if args.dataset else dataset_mod.build()
+    if args.dataset:
+        ds, source = pd.read_parquet(args.dataset), args.dataset
+    else:
+        ds, source = dataset_mod.build(), str(DEFAULT_FUNDING_DB)
     if ds.empty:
         logger.error("empty dataset — aborting")
         return
-    summary = train(ds)
+    summary = train(ds, source=source)
     print("\n" + "=" * 64)
     print(f"run {summary['run_id']}  ->  {REGISTERED_MODEL} v{summary['version']}")
     print(f"walk_forward_auc={summary['walk_forward_auc']:.4f}  "
