@@ -142,7 +142,8 @@ def run(skip_reload: bool = False) -> dict:
     logger.info("training set: %d rows | by source: %s",
                 len(combined), combined[dataset_csv.SOURCE_COL].value_counts().to_dict())
 
-    summary = train_mod.train(combined.drop(columns=[dataset_csv.SOURCE_COL]))
+    summary = train_mod.train(combined.drop(columns=[dataset_csv.SOURCE_COL]),
+                              source=str(dataset_csv.CSV_PATH))
     logger.info("retrain: v%s walk_forward_auc=%.4f promoted=%s",
                 summary["version"], summary["walk_forward_auc"], summary["promoted"])
 
