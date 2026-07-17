@@ -1,0 +1,377 @@
+openapi: 3.1.0
+
+info:
+  title: SL-Probability Prediction Service
+  version: "1.0.0"
+  description: |
+    Stop-loss probability scoring for funding-arbitrage positions.
+
+    The caller (the funding bot) sends a `{symbol, exchange}` pair; the service builds a
+    65-feature vector from live 1m Binance klines and returns `p_sl` — the model's raw
+    probability that the position would be stopped out. **The service does no sizing and
+    applies no threshold.** Interpreting `p_sl` is entirely the caller's job.
+
+    ### Things worth knowing before you integrate
+
+    * **Binance only.** The model is trained on Binance data, so any other `exchange`
+      value is rejected with a `400` rather than scored off-distribution.
+    * **`save` defaults to `false`.** Only calls with `save: true` are persisted to the
+      feature store and become future training data. Probes, health checks, and manual
+      curls therefore leave the training log untouched by default. If you are the bot
+      making a real production prediction, you must pass `save: true`.
+    * **It fails closed.** A BTC frame that cannot reach the sampled bar, no kline at the
+      sampled bar, too little token history, or any NaN feature produces an error — never a
+      degraded prediction, and never a vector quietly sampled at the wrong bar. Treat every
+      non-200 as "no signal", not as "probability zero".
+    * **The model is hot-swapped, not restarted.** `model_version` in the response tells
+      you which registry version produced the number; it changes under you after a
+      retrain calls `/reload`.
+
+servers:
+  - url: http://127.0.0.1:8100
+    description: Host loopback. The port is published on 127.0.0.1 only — the service is not exposed off-host.
+  - url: http://predictor:8100
+    description: Docker compose network DNS. Use this from other containers in the stack (this is how the retrain job reaches /reload).
+
+paths:
+  /predict:
+    post:
+      summary: Score a symbol's stop-loss probability
+      description: |
+        Generates features from the last ~300 1m klines for `symbol`, joins them against the
+        shared BTC frame kept warm in memory by a background refresher, and scores them with
+        the in-memory `sl_classifier@production` model. MLflow is not touched on this path.
+
+        Features are sampled at the **last closed minute** (`now` floored to the minute, minus
+        one minute) — that timestamp comes back as `event_time`. The service verifies that a
+        kline actually exists at that bar and that the BTC frame reaches it, rather than
+        silently falling back to an earlier bar; when either is untrue it errors (see 422/503).
+
+        Repeated calls for the same symbol within an 8s TTL reuse the cached klines, so a burst
+        of retries collapses into one upstream fetch. Note that this dedupes the *fetch*, not
+        the *answer*: a retry that straddles a minute boundary still gets a new `event_time`,
+        and so possibly a new `p_sl` — the cache is bypassed when it does not reach the new bar.
+
+        Passing `save: true` additionally appends the full 65-feature vector and `p_sl` to the
+        sqlite feature store, which is what later gets labeled and folded into retraining.
+        The write is best-effort: if it fails, you still get your prediction, but with
+        `saved: false` (see the field docs below — a `200` with `saved: false` is not an error,
+        and when you didn't ask to save it is the expected result).
+      operationId: predict
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PredictRequest"
+            examples:
+              probe:
+                summary: Ad-hoc probe (not persisted)
+                value: { symbol: "BTCUSDT", exchange: "binance" }
+              production:
+                summary: Real production prediction (persisted for retraining)
+                value: { symbol: "SOLUSDT", exchange: "binance", save: true }
+      responses:
+        "200":
+          description: Scored successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PredictResponse"
+              examples:
+                scored:
+                  summary: Probe — scored but deliberately not persisted
+                  value:
+                    p_sl: 0.34425581142175904
+                    model_version: "5"
+                    event_time: "2026-07-12T02:37:00Z"
+                    saved: false
+                persisted:
+                  summary: Production call — scored and written to the feature store
+                  value:
+                    p_sl: 0.612
+                    model_version: "5"
+                    event_time: "2026-07-12T02:37:00Z"
+                    saved: true
+        "400":
+          description: |
+            Unsupported exchange. The model is Binance-trained; anything else is refused rather
+            than scored off-distribution. Fix the request — retrying will not help.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { detail: "unsupported exchange" }
+        "422":
+          description: |
+            Two distinct cases share this status, and they are told apart by the *shape* of
+            `detail` — a string means the service rejected it, a list means the request body
+            was malformed.
+
+            * **`detail` is a string (`"insufficient history"`)** — fewer than 241 usable 1m
+              bars for the symbol, or a NaN in the generated feature vector. Typical for newly
+              listed or thinly traded symbols. Retrying immediately will not help; the symbol
+              needs more history.
+            * **`detail` is a string (`"no kline bar at the sample timestamp"`)** — Binance has
+              not produced a bar for the sampled minute yet. Binance only creates a bar once a
+              trade occurs, so this shows up on thinly traded symbols called within the first
+              seconds of a new minute. The service refuses rather than serve the previous
+              minute's features under this minute's `event_time`. **This one is worth a retry**
+              a few seconds later, once the bar exists.
+            * **`detail` is a list** — FastAPI request validation: a missing or wrong-typed
+              field (e.g. no `symbol`). A client bug.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Error"
+                  - $ref: "#/components/schemas/ValidationError"
+              examples:
+                insufficient_history:
+                  summary: Not enough bars / NaN feature — service-level reject
+                  value: { detail: "insufficient history" }
+                no_bar_at_sample:
+                  summary: Binance has no bar for the sampled minute yet — retryable
+                  value: { detail: "no kline bar at the sample timestamp" }
+                bad_request_body:
+                  summary: Malformed body — FastAPI validation
+                  value:
+                    detail:
+                      - loc: ["body", "symbol"]
+                        msg: "Field required"
+                        type: "missing"
+        "502":
+          description: |
+            The upstream Binance kline fetch for `symbol` failed. Transient — this is the one
+            error class where a retry (with backoff) is reasonable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { detail: "kline fetch failed: <upstream error>" }
+        "503":
+          description: |
+            The service cannot score right now — it is up but not in a fit state, and is
+            failing closed rather than guessing.
+
+            * `"model not loaded"` — no `@production` model in the registry, or startup load failed.
+            * `"btc frame unavailable/stale"` — the shared BTC frame is missing, or its newest
+              closed bar does not reach the sampled minute even after an on-demand refetch. The
+              test is **bar alignment, not wall-clock age**: BTC features are reindex-ffilled
+              onto the token's bars, so a frame one bar short would silently freeze every
+              `btc_*` feature at the previous minute instead of erroring. Usually transient
+              (an upstream fetch failure); a retry is reasonable.
+
+            Note `/health`'s `btc_age_sec` / `degraded` still use the 90s wall-clock threshold
+            (`SLP_BTC_MAX_AGE_SEC`) as a coarse liveness signal. It is deliberately *not* the
+            gate `/predict` applies, so `/health: ok` does not by itself guarantee the next
+            `/predict` finds an aligned frame.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                no_model:
+                  value: { detail: "model not loaded" }
+                stale_btc:
+                  value: { detail: "btc frame unavailable/stale" }
+        "500":
+          description: |
+            Unhandled error during feature generation or scoring — FastAPI's default handler,
+            so the body is `{"detail": "Internal Server Error"}` with no specifics. Unlike the
+            errors above this one is not deliberate: reaching it means the request passed
+            validation but the data broke something downstream. Check the service logs; the
+            traceback is there.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { detail: "Internal Server Error" }
+
+  /health:
+    get:
+      summary: Liveness / readiness
+      description: |
+        Cheap, dependency-free snapshot of in-memory state. Used by the compose healthcheck
+        every 15s. Always returns `200` even when unhealthy — read the `status` field rather
+        than the HTTP code.
+      operationId: health
+      responses:
+        "200":
+          description: |
+            `status` is `"ok"` only when a model is loaded **and** the BTC frame is fresher than
+            90s. This is a coarse liveness signal, not the gate `/predict` applies: `/predict`
+            requires the BTC frame to reach the *sampled bar* and refetches on demand. So
+            `degraded` is a strong hint that `/predict` is unhappy, but `ok` is not a guarantee
+            that the next `/predict` will score.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                ok:
+                  summary: Serving normally
+                  value:
+                    status: "ok"
+                    model_loaded: true
+                    model_version: "5"
+                    n_features: 65
+                    btc_age_sec: 6.6
+                    predictions_logged: 0
+                degraded:
+                  summary: Model up, BTC frame stale — /predict is 503ing
+                  value:
+                    status: "degraded"
+                    model_loaded: true
+                    model_version: "5"
+                    n_features: 65
+                    btc_age_sec: 142.8
+                    predictions_logged: 0
+
+  /reload:
+    post:
+      summary: Hot-swap to the current @production model
+      description: |
+        Re-reads `sl_classifier@production` from the MLflow registry and swaps the in-memory
+        model and its ordered feature list, with no restart and no dropped requests. Takes no
+        request body.
+
+        This is normally called *for* you: the retrain job posts here after promoting a new
+        version (see `retrain_monthly.py::_reload_service`). Call it by hand when you have
+        promoted or rolled back an alias out-of-band and want the live service to pick it up.
+
+        Note the retrain job treats a failed reload as **non-fatal** — it logs a warning and
+        exits 0. So after an automated retrain, confirm the swap actually landed by checking
+        `model_version` on `/health` rather than trusting the job's exit code.
+      operationId: reload
+      responses:
+        "200":
+          description: Swapped. The returned `model_version` is what the service is serving from now on.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReloadResponse"
+              example: { reloaded: true, model_version: "5", n_features: 65 }
+        "500":
+          description: |
+            The reload failed and **the previously loaded model is still being served** — the
+            swap is all-or-nothing, so a failure here degrades nothing. Usual causes: MLflow
+            unreachable, or no `@production` alias on `sl_classifier`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { detail: "reload failed: <exception>" }
+
+components:
+  schemas:
+    PredictRequest:
+      type: object
+      required: [symbol, exchange]
+      properties:
+        symbol:
+          type: string
+          description: Binance perpetual symbol, exactly as Binance spells it (uppercase, USDT-quoted).
+          examples: ["BTCUSDT", "SOLUSDT"]
+        exchange:
+          type: string
+          description: Must be `binance` (case-insensitive). Any other value is a `400`.
+          examples: ["binance"]
+        save:
+          type: boolean
+          default: false
+          description: |
+            Persist this prediction's feature vector to the feature store, making it eligible
+            to be labeled and used in a future retrain. **Leave it `false` (the default) unless
+            this is a real production prediction** — the point of the flag is to keep probes and
+            tests out of the training data.
+
+    PredictResponse:
+      type: object
+      required: [p_sl, model_version, event_time, saved]
+      properties:
+        p_sl:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: |
+            Raw model probability that this position gets stopped out. **Uncalibrated and
+            un-thresholded** — the service deliberately does not decide anything for you. The
+            training base rate is ~14.8%, so values well above that are the model flagging
+            elevated risk, not a coin flip.
+        model_version:
+          type: string
+          description: MLflow registry version that produced this number (a stringified integer, e.g. `"5"`). Changes without warning after a retrain + `/reload`.
+          examples: ["5"]
+        event_time:
+          type: string
+          format: date-time
+          description: |
+            UTC timestamp of the bar the features were sampled at — the last *closed* minute,
+            i.e. current minute minus one. Not the time the request was served. Two calls in the
+            same minute return the same `event_time`.
+          examples: ["2026-07-12T02:37:00Z"]
+        saved:
+          type: boolean
+          description: |
+            Whether the feature vector was written to the feature store. `false` when you did not
+            ask to save (the default, and the common case), **and also** when `save: true` but the
+            sqlite write failed — persistence is best-effort and never fails a prediction. If you
+            passed `save: true` and get `saved: false`, the prediction is still valid but it will
+            not feed retraining; check the service logs.
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+          description: '`ok` iff a model is loaded AND `btc_age_sec` <= 90 — a coarse liveness signal, not the gate `/predict` applies (that one is BTC bar alignment, checked per request).'
+        model_loaded:
+          type: boolean
+        model_version:
+          type: [string, "null"]
+          description: Registry version currently in memory; `null` if no model ever loaded.
+        n_features:
+          type: integer
+          description: Length of the model's ordered feature list. Expected to be 65; a 57 here would mean the BTC-derived features are missing and something is badly wrong.
+          examples: [65]
+        btc_age_sec:
+          type: [number, "null"]
+          description: Seconds since the shared BTC frame was last refreshed (`null` if never fetched). A background refresher runs every ~25s, and `/predict` additionally refetches on demand when the frame does not reach the bar it needs — so this is an observability signal, not the predict-time gate.
+        predictions_logged:
+          type: [integer, "null"]
+          description: 'Rows in the feature store — i.e. the cumulative count of `save: true` predictions. Stays at 0 for as long as callers only send probes.'
+
+    ReloadResponse:
+      type: object
+      properties:
+        reloaded:
+          type: boolean
+          description: Always `true` on a 200; a failure is signalled by the 500, not by this field.
+        model_version:
+          type: string
+          examples: ["5"]
+        n_features:
+          type: integer
+          examples: [65]
+
+    Error:
+      type: object
+      description: The service's own rejections (`HTTPException`) — `detail` is a human-readable string.
+      properties:
+        detail:
+          type: string
+      required: [detail]
+
+    ValidationError:
+      type: object
+      description: FastAPI request-body validation failure — note `detail` is a *list* here, not a string.
+      properties:
+        detail:
+          type: array
+          items:
+            type: object
+            properties:
+              loc:
+                type: array
+                items: { type: [string, integer] }
+              msg: { type: string }
+              type: { type: string }
+      required: [detail]
