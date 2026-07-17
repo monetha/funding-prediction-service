@@ -23,3 +23,7 @@ logs/
 
 # local Claude Code permissions (machine-specific)
 .claude/settings.local.json
+
+
+# experiments folder
+experiments/

@@ -6,14 +6,16 @@ bot owns all sizing. Binance-trained -> non-Binance requests are rejected (off-d
 Design (see plan lively-spinning-moon.md):
   * startup loads the @production model + its ordered feats.json ONCE into memory;
     requests never touch MLflow. /reload hot-swaps after a retrain.
-  * a background refresher fetches the shared BTC frame every ~25s into memory; requests
-    read it with ZERO BTC fetches on the hot path. Token klines get a short per-symbol
-    TTL to absorb burst duplicates.
+  * a background refresher fetches the shared BTC frame every ~25s into memory, so the hot
+    path normally does ZERO BTC fetches; a request refetches inline (once, under a lock)
+    only when the cached frame does not reach its sample bar. Token klines get a short
+    per-symbol TTL to absorb burst duplicates.
   * a prediction sent with save=true appends its 65-feature vector + p_sl to the sqlite
     feature store (non-fatal) for later labeling / retraining. save defaults to false, so
     only the calls the bot marks as real production predictions enter the training log.
-  * fail-closed: BTC missing/stale, too little token history, or any NaN feature -> error,
-    never a silent fall back to the 57-feature (no-BTC) model input.
+  * fail-closed: BTC that cannot reach the sample bar, no token bar AT the sample bar, too
+    little token history, or any NaN feature -> error, never a silent fall back to the
+    57-feature (no-BTC) model input and never a vector quietly sampled at the wrong bar.
 
     uvicorn serving.app:app --host 0.0.0.0 --port 8100
 """
@@ -163,6 +165,45 @@ async def _btc_refresher():
         await asyncio.sleep(BTC_REFRESH_SEC)
 
 
+# Serialises the on-demand refresh below: the bot fires several symbols at once just after
+# the hour, and without this every one of them would launch its own BTC fetch.
+_btc_lock = asyncio.Lock()
+
+
+async def _btc_for(sample_ts: pd.Timestamp) -> pd.DataFrame | None:
+    """The BTC frame to build features with, guaranteed to REACH `sample_ts`, or None.
+
+    Wall-clock age is the wrong correctness test. `_btc_block` reindex-ffills BTC onto the
+    token index, so a frame whose last bar is one minute short does not fail — it silently
+    freezes every btc_* feature at the previous bar. The background refresher is free-running
+    (BTC_REFRESH_SEC), and requests land a few seconds after the minute boundary, so its
+    newest closed bar was reliably one minute behind the sample bar: measured drift on 16/16
+    production rows (experiments/FINDINGS.md). BTC_MAX_AGE_SEC=90 never caught it because
+    1-bar staleness is always well within it.
+
+    So test bar alignment, not age, and refetch inline when the cached frame is short. BTC is
+    liquid enough that its sample-minute bar always exists, making an inline fetch reliable;
+    fail closed if even that comes up short.
+
+    Cost: at the bot's cadence the refresher is usually 1 bar behind, so the inline fetch is
+    the COMMON path at a minute boundary, not a rare one — the old "zero BTC fetches on the
+    hot path" property is gone. The lock keeps it to one fetch per boundary (~250ms for the
+    first caller, which the rest then reuse) rather than one per symbol.
+    """
+    btc = state.btc
+    if btc is not None and len(btc) and btc.index[-1] >= sample_ts:
+        return btc
+    async with _btc_lock:
+        btc = state.btc                    # another request may have refreshed us while we waited
+        if btc is not None and len(btc) and btc.index[-1] >= sample_ts:
+            return btc
+        await _refresh_btc_once()
+        btc = state.btc
+    if btc is None or not len(btc) or btc.index[-1] < sample_ts:
+        return None
+    return btc
+
+
 # --------------------------------------------------------------------------- #
 # lifespan: load model, open session/store, start refresher
 # --------------------------------------------------------------------------- #
@@ -188,12 +229,18 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="SL-Probability Prediction Service", lifespan=lifespan)
 
 
-async def _get_token_klines(symbol: str) -> pd.DataFrame:
-    """Per-symbol TTL-cached token klines (dedupes burst/retry). Never fetches BTC."""
+async def _get_token_klines(symbol: str, sample_ts: pd.Timestamp) -> pd.DataFrame:
+    """Per-symbol TTL-cached token klines (dedupes burst/retry). Never fetches BTC.
+
+    A frame is only reusable if it actually reaches `sample_ts`: the TTL can span a minute
+    boundary, and a frame fetched last minute would otherwise be served for this minute's
+    bar and ffilled back to a stale row."""
     now = time.monotonic()
     cached = state.token_cache.get(symbol)
     if cached and now - cached[0] < TOKEN_TTL_SEC:
-        return cached[1]
+        df = cached[1]
+        if len(df) and df.index[-1] >= sample_ts:
+            return df
     df = await fetch_raw_1m(state.session, symbol, limit=KLINE_LIMIT)
     state.token_cache[symbol] = (now, df)
     return df
@@ -217,21 +264,30 @@ async def _predict(req: PredictRequest, started: float):
     if state.model is None:
         raise HTTPException(status_code=503, detail="model not loaded")
 
-    # fail-closed on a missing/stale BTC frame — never drop to the 57-feature input
-    age = state.btc_age()
-    if state.btc is None or age is None or age > BTC_MAX_AGE_SEC:
+    # Fix sample_ts BEFORE fetching: pinning the target bar first means the frames are
+    # validated against it, rather than the bar being inferred from whatever arrived.
+    sample_ts = pd.Timestamp.now(tz=timezone.utc).floor("min") - pd.Timedelta(minutes=1)
+
+    # fail-closed on a BTC frame that cannot reach the sample bar — never drop to the
+    # 57-feature input, and never let the reindex-ffill quietly stale the btc_* features
+    btc = await _btc_for(sample_ts)
+    if btc is None:
         raise HTTPException(status_code=503, detail="btc frame unavailable/stale")
 
     try:
-        df1m = await _get_token_klines(req.symbol)
+        df1m = await _get_token_klines(req.symbol, sample_ts)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"kline fetch failed: {exc}")
     if len(df1m) < MIN_BARS:
         raise HTTPException(status_code=422, detail="insufficient history")
 
-    sample_ts = pd.Timestamp.now(tz=timezone.utc).floor("min") - pd.Timedelta(minutes=1)
-    fg = FeatureGenerator(btc=state.btc)
+    fg = FeatureGenerator(btc=btc)
     frame = fg.generate(df1m)
+    # sample_at ffills, so a missing sample bar silently yields an EARLIER bar's features
+    # logged under the requested event_time. dataset_csv.fill_from_rest already refuses to
+    # write such a row; serving must refuse to serve one.
+    if sample_ts not in frame.index:
+        raise HTTPException(status_code=422, detail="no kline bar at the sample timestamp")
     row = fg.sample_at(frame, [sample_ts])
     X = row.reindex(columns=state.feats).astype("float32")
     if bool(X.isna().any(axis=None)):
