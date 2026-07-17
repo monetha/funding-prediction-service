@@ -7,9 +7,11 @@ buy base volume `tbb`, quote volume, trade count — which exist ONLY in raw kli
 
 Key serving contract:
   * symbol mapping: CCXT unified 'SOL/USDT:USDT' -> Binance 'SOLUSDT'.
-  * DROP the in-progress last bar: Binance returns the current (still-forming) minute
-    as the last element. After dropping it the last bar's open time is
-    now.floor('min') - 1min == the sample bar (matches training FEATURE_LAG_MIN=1).
+  * DROP the in-progress last bar, but ONLY when it really is in progress (its open time
+    is the current minute) — Binance creates a bar only once a trade occurs, so an
+    illiquid symbol's last element early in a new minute is already closed. Either way
+    the resulting last bar's open time is now.floor('min') - 1min == the sample bar
+    (matches training FEATURE_LAG_MIN=1).
   * limit=300: longest rolling window is 240 bars, beta/corr_btc need 120, pct_change
     needs 1 prior -> need >=241; 300 gives headroom after dropping the partial bar.
 """
@@ -34,6 +36,19 @@ _IDX = {"open": 1, "high": 2, "low": 3, "close": 4, "volume": 5,
         "quote_vol": 7, "trades": 8, "tbb": 9}
 
 
+def _is_partial(bar: list) -> bool:
+    """Is this kline the still-forming current minute?
+
+    Binance only creates a bar once a trade occurs in it, so the last element is NOT
+    always partial: for an illiquid symbol in the first seconds of a new minute the bar
+    does not exist yet and the last element is the newest CLOSED bar. Dropping it
+    unconditionally discarded that bar, and FeatureGenerator.sample_at's ffill then
+    silently served the minute BEFORE the requested one (see experiments/FINDINGS.md).
+    Compare the open time to the current minute instead of trusting position.
+    """
+    return pd.to_datetime(bar[0], unit="ms", utc=True) == pd.Timestamp.now(tz="UTC").floor("min")
+
+
 def to_binance_symbol(symbol: str) -> str:
     """CCXT unified / loose forms -> Binance futures symbol.
     'SOL/USDT:USDT' -> 'SOLUSDT'; 'SOL/USDT' -> 'SOLUSDT'; 'SOLUSDT' -> 'SOLUSDT'."""
@@ -48,7 +63,7 @@ def parse_klines(raw: list, drop_partial: bool = True) -> pd.DataFrame:
     Drops the in-progress last bar by default (see module docstring)."""
     if not raw:
         return pd.DataFrame(columns=_COLS)
-    if drop_partial:
+    if drop_partial and _is_partial(raw[-1]):
         raw = raw[:-1]              # last element is the current, still-forming minute
     idx = pd.to_datetime([r[0] for r in raw], unit="ms", utc=True)
     data = {c: [float(r[_IDX[c]]) for r in raw] for c in _COLS}
